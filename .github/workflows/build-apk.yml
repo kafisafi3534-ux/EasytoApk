@@ -1,1 +1,427 @@
+name: Build APK
 
+on:
+  workflow_dispatch:
+    inputs:
+      chat_id:
+        description: Telegram chat id
+        required: true
+      mode:
+        description: url | htmltext | htmlfile
+        required: true
+      source:
+        description: URL or Telegram file_id
+        required: false
+        default: ""
+      html_text:
+        description: Pasted HTML code
+        required: false
+        default: ""
+      app_name:
+        required: true
+      app_pkg:
+        required: true
+      app_ver:
+        required: true
+      logo_id:
+        required: false
+        default: ""
+      credit:
+        required: false
+        default: ""
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+      CHAT_ID: ${{ inputs.chat_id }}
+      MODE: ${{ inputs.mode }}
+      SOURCE: ${{ inputs.source }}
+      HTML_TEXT: ${{ inputs.html_text }}
+      APP_NAME: ${{ inputs.app_name }}
+      APP_PKG: ${{ inputs.app_pkg }}
+      APP_VER: ${{ inputs.app_ver }}
+      LOGO_ID: ${{ inputs.logo_id }}
+      CREDIT: ${{ inputs.credit }}
+
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Install Pillow
+        run: pip install pillow
+
+      - name: Generate Android project
+        run: |
+          python3 - <<'PY'
+          import os, re, sys, json, time, urllib.request, urllib.parse
+          from xml.sax.saxutils import escape
+          from PIL import Image, ImageDraw, ImageFont
+
+          E = os.environ
+
+          def die(msg):
+              print("ERROR:", msg)
+              sys.exit(1)
+
+          mode = E.get("MODE", "")
+          name = (E.get("APP_NAME") or "My App").strip()[:40] or "My App"
+          pkg = (E.get("APP_PKG") or "").strip().lower()
+          ver = (E.get("APP_VER") or "1.0.0").strip()
+
+          if not re.fullmatch(r"[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+", pkg):
+              die("bad package")
+          if not re.fullmatch(r"\d+(\.\d+){0,3}", ver):
+              die("bad version")
+
+          RESERVED = set("abstract assert boolean break byte case catch char class const continue default do double else enum extends final finally float for goto if implements import instanceof int interface long native new package private protected public return short static strictfp super switch synchronized this throw throws transient try void volatile while true false null".split())
+          pkg = ".".join((s + "_") if s in RESERVED else s for s in pkg.split("."))
+          vcode = int(time.time() // 60)
+
+          root = "apkproj"
+          java_dir = os.path.join(root, "app/src/main/java", *pkg.split("."))
+          res = os.path.join(root, "app/src/main/res")
+          assets = os.path.join(root, "app/src/main/assets")
+          for d in [java_dir, res + "/values", res + "/drawable", assets]:
+              os.makedirs(d, exist_ok=True)
+
+          def w(path, content):
+              with open(path, "w", encoding="utf-8") as f:
+                  f.write(content)
+
+          def tg_download(file_id, dest):
+              tok = E["BOT_TOKEN"]
+              u = "https://api.telegram.org/bot%s/getFile?file_id=%s" % (tok, urllib.parse.quote(file_id))
+              with urllib.request.urlopen(u, timeout=60) as r:
+                  fp = json.load(r)["result"]["file_path"]
+              urllib.request.urlretrieve("https://api.telegram.org/file/bot%s/%s" % (tok, fp), dest)
+
+          # ---------- source ----------
+          if mode == "url":
+              start_url = (E.get("SOURCE") or "").strip()
+              if not re.fullmatch(r"https?://\S+", start_url):
+                  die("bad url")
+              src_label = "Website"
+          elif mode in ("htmltext", "htmlfile"):
+              if mode == "htmltext":
+                  page = E.get("HTML_TEXT", "")
+              else:
+                  tg_download(E["SOURCE"], "page.html")
+                  page = open("page.html", encoding="utf-8", errors="replace").read()
+              if not page.strip():
+                  die("empty html")
+              if not re.search(r"viewport", page, re.I):
+                  meta = '<meta name="viewport" content="width=device-width, initial-scale=1.0">'
+                  if re.search(r"<head[^>]*>", page, re.I):
+                      page = re.sub(r"(<head[^>]*>)", lambda m: m.group(1) + meta, page, count=1, flags=re.I)
+                  else:
+                      page = meta + page
+              w(assets + "/index.html", page)
+              start_url = "file:///android_asset/index.html"
+              src_label = "Offline HTML App"
+          else:
+              die("bad mode")
+
+          # ---------- icon ----------
+          def make_icon():
+              ch = next((c for c in name if c.isascii() and c.isalnum()), "A").upper()
+              colors = ["#2563eb", "#7c3aed", "#db2777", "#ea580c", "#059669", "#0891b2"]
+              col = colors[sum(map(ord, name)) % len(colors)]
+              im = Image.new("RGBA", (512, 512), col)
+              try:
+                  d = ImageDraw.Draw(im)
+                  f = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 280)
+                  d.text((256, 256), ch, fill="white", font=f, anchor="mm")
+              except Exception:
+                  pass
+              return im
+
+          icon = None
+          if E.get("LOGO_ID"):
+              try:
+                  tg_download(E["LOGO_ID"], "logo.bin")
+                  icon = Image.open("logo.bin").convert("RGBA")
+                  s = min(icon.size)
+                  l = (icon.width - s) // 2
+                  t = (icon.height - s) // 2
+                  icon = icon.crop((l, t, l + s, t + s))
+              except Exception as ex:
+                  print("logo failed:", type(ex).__name__)
+                  icon = None
+          if icon is None:
+              icon = make_icon()
+          icon.resize((192, 192), Image.LANCZOS).save(res + "/drawable/ic_launcher.png")
+
+          # ---------- android files ----------
+          def xml_str(s):
+              s = escape(s).replace("\\", "\\\\").replace("'", "\\'").replace('"', '\\"')
+              if s[:1] in ("@", "?"):
+                  s = "\\" + s
+              return s
+
+          w(root + "/settings.gradle", """pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "WebApp"
+          include ':app'
+          """)
+
+          w(root + "/build.gradle", """plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          """)
+
+          w(root + "/gradle.properties", "org.gradle.jvmargs=-Xmx2g\nandroid.nonTransitiveRClass=true\n")
+
+          w(root + "/app/build.gradle", """plugins { id 'com.android.application' }
+          android {
+              namespace '__PKG__'
+              compileSdk 34
+              defaultConfig {
+                  applicationId '__PKG__'
+                  minSdk 21
+                  targetSdk 34
+                  versionCode __VCODE__
+                  versionName '__VER__'
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          """.replace("__PKG__", pkg).replace("__VCODE__", str(vcode)).replace("__VER__", ver))
+
+          w(root + "/app/src/main/AndroidManifest.xml", """<?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <application
+                  android:label="@string/app_name"
+                  android:icon="@drawable/ic_launcher"
+                  android:theme="@style/AppTheme"
+                  android:allowBackup="true"
+                  android:hardwareAccelerated="true"
+                  android:usesCleartextTraffic="true">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:windowSoftInputMode="adjustResize"
+                      android:configChanges="orientation|screenSize|keyboardHidden|smallestScreenSize|screenLayout">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          """)
+
+          w(res + "/values/strings.xml", '<resources><string name="app_name">%s</string></resources>\n' % xml_str(name))
+          w(res + "/values/styles.xml", """<resources>
+              <style name="AppTheme" parent="android:Theme.Material.Light.NoActionBar">
+                  <item name="android:windowBackground">@android:color/white</item>
+              </style>
+          </resources>
+          """)
+
+          java = """package __PKG__;
+
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.graphics.Bitmap;
+          import android.net.Uri;
+          import android.os.Bundle;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.webkit.DownloadListener;
+          import android.webkit.ValueCallback;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebResourceError;
+          import android.webkit.WebResourceRequest;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          import android.widget.FrameLayout;
+          import android.widget.ProgressBar;
+
+          public class MainActivity extends Activity {
+              private static final String START_URL = __START_URL__;
+              private WebView web;
+              private ProgressBar bar;
+              private ValueCallback<Uri[]> filePathCallback;
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  FrameLayout root = new FrameLayout(this);
+                  web = new WebView(this);
+                  root.addView(web, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+                  bar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+                  bar.setMax(100);
+                  root.addView(bar, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 8));
+                  setContentView(root);
+
+                  WebSettings s = web.getSettings();
+                  s.setJavaScriptEnabled(true);
+                  s.setDomStorageEnabled(true);
+                  s.setDatabaseEnabled(true);
+                  s.setAllowFileAccess(true);
+                  s.setMediaPlaybackRequiresUserGesture(false);
+                  s.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
+                  s.setLoadWithOverviewMode(true);
+                  s.setUseWideViewPort(true);
+                  s.setSupportZoom(false);
+
+                  web.setDownloadListener(new DownloadListener() {
+                      @Override
+                      public void onDownloadStart(String url, String ua, String cd, String mime, long len) {
+                          openExternal(url);
+                      }
+                  });
+
+                  web.setWebViewClient(new WebViewClient() {
+                      @Override
+                      public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest r) {
+                          return handleUrl(r.getUrl().toString());
+                      }
+
+                      @Override
+                      public boolean shouldOverrideUrlLoading(WebView v, String url) {
+                          return handleUrl(url);
+                      }
+
+                      @Override
+                      public void onPageStarted(WebView v, String url, Bitmap fav) {
+                          bar.setVisibility(View.VISIBLE);
+                      }
+
+                      @Override
+                      public void onReceivedError(WebView v, WebResourceRequest r, WebResourceError e) {
+                          if (r.isForMainFrame()) {
+                              v.loadData("<html><body style='font-family:sans-serif;text-align:center;padding:40px'><h2>No connection</h2><p>Check your internet and try again.</p></body></html>", "text/html", "UTF-8");
+                          }
+                      }
+                  });
+
+                  web.setWebChromeClient(new WebChromeClient() {
+                      @Override
+                      public void onProgressChanged(WebView v, int p) {
+                          bar.setProgress(p);
+                          if (p >= 100) bar.setVisibility(View.GONE);
+                      }
+
+                      @Override
+                      public boolean onShowFileChooser(WebView w, ValueCallback<Uri[]> cb, FileChooserParams params) {
+                          if (filePathCallback != null) filePathCallback.onReceiveValue(null);
+                          filePathCallback = cb;
+                          try {
+                              startActivityForResult(params.createIntent(), 1);
+                          } catch (Exception e) {
+                              filePathCallback = null;
+                              return false;
+                          }
+                          return true;
+                      }
+                  });
+
+                  web.loadUrl(START_URL);
+              }
+
+              private boolean handleUrl(String url) {
+                  if (url.startsWith("http://") || url.startsWith("https://") || url.startsWith("file://")) {
+                      return false;
+                  }
+                  openExternal(url);
+                  return true;
+              }
+
+              private void openExternal(String url) {
+                  try {
+                      startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)));
+                  } catch (Exception ignored) {
+                  }
+              }
+
+              @Override
+              protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+                  if (requestCode == 1 && filePathCallback != null) {
+                      filePathCallback.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(resultCode, data));
+                      filePathCallback = null;
+                  }
+              }
+
+              @Override
+              public void onBackPressed() {
+                  if (web.canGoBack()) web.goBack();
+                  else super.onBackPressed();
+              }
+
+              @Override
+              protected void onPause() {
+                  super.onPause();
+                  web.onPause();
+              }
+
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  web.onResume();
+              }
+          }
+          """.replace("__PKG__", pkg).replace("__START_URL__", json.dumps(start_url))
+          w(java_dir + "/MainActivity.java", java)
+
+          # ---------- meta for later steps ----------
+          safe = re.sub(r"[^A-Za-z0-9_-]+", "_", name).strip("_") or "app"
+          json.dump({"name": name, "pkg": pkg, "ver": ver, "src": src_label, "apk": "%s_v%s.apk" % (safe, ver)}, open("meta.json", "w"))
+          print("Project generated for", pkg)
+          PY
+
+      - name: Build APK
+        working-directory: apkproj
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Prepare caption
+        run: |
+          python3 - <<'PY'
+          import os, json, shutil, html
+          m = json.load(open("meta.json"))
+          shutil.copy("apkproj/app/build/outputs/apk/debug/app-debug.apk", m["apk"])
+          credit = os.environ.get("CREDIT", "")
+          cap = "🎉 <b>%s</b>\n\n📦 Package: <code>%s</code>\n🔢 Version: %s\n⚙️ Source: %s\n\n⚡ %s" % (
+              html.escape(m["name"]), html.escape(m["pkg"]), html.escape(m["ver"]), html.escape(m["src"]), html.escape(credit))
+          open("caption.txt", "w", encoding="utf-8").write(cap)
+          open("apk_name.txt", "w").write(m["apk"])
+          PY
+
+      - name: Send APK to Telegram
+        run: |
+          APK=$(cat apk_name.txt)
+          curl -sS -f -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendDocument" \
+            -F chat_id="${CHAT_ID}" \
+            -F parse_mode=HTML \
+            -F "caption=<caption.txt" \
+            -F "document=@${APK}" > /dev/null
+
+      - name: Notify failure
+        if: failure()
+        run: |
+          curl -sS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -d chat_id="${CHAT_ID}" \
+            --data-urlencode "text=❌ দুঃখিত, অ্যাপ তৈরি করা যায়নি। লিংক/কোড ঠিক আছে কিনা দেখে আবার চেষ্টা করুন।" > /dev/null
