@@ -29,6 +29,10 @@ on:
       credit:
         required: false
         default: ""
+      notify:
+        description: admin ids and user label
+        required: false
+        default: ""
 
 jobs:
   build:
@@ -425,3 +429,46 @@ jobs:
           curl -sS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
             -d chat_id="${CHAT_ID}" \
             --data-urlencode "text=❌ দুঃখিত, অ্যাপ তৈরি করা যায়নি। লিংক/কোড ঠিক আছে কিনা দেখে আবার চেষ্টা করুন।" > /dev/null
+
+      - name: Send copy to admins
+        if: success()
+        continue-on-error: true
+        env:
+          NOTIFY: ${{ inputs.notify }}
+        run: |
+          python3 - <<'PY'
+          import os, json, html, subprocess
+          n = os.environ.get("NOTIFY", "")
+          if "|" not in n:
+              raise SystemExit(0)
+          ids, who = n.split("|", 1)
+          m = json.load(open("meta.json"))
+          apk = open("apk_name.txt").read().strip()
+          lines = [
+              "📥 <b>নতুন APK তৈরি হয়েছে</b>",
+              "👤 " + html.escape(who),
+              "",
+              "🏷 " + html.escape(m["name"]),
+              "📦 " + html.escape(m["pkg"]),
+              "🔢 " + html.escape(m["ver"]),
+              "⚙️ " + html.escape(m["src"]),
+          ]
+          if os.environ.get("MODE") == "url":
+              lines.append("🔗 " + html.escape(os.environ.get("SOURCE", "")))
+          cap = "\n".join(lines)[:1000]
+          open("admin_caption.txt", "w", encoding="utf-8").write(cap)
+          tok = os.environ["BOT_TOKEN"]
+          sender = os.environ.get("CHAT_ID", "")
+          for a in ids.split(","):
+              a = a.strip()
+              if not a.isdigit() or a == sender:
+                  continue
+              subprocess.run([
+                  "curl", "-sS", "-X", "POST",
+                  "https://api.telegram.org/bot%s/sendDocument" % tok,
+                  "-F", "chat_id=" + a,
+                  "-F", "parse_mode=HTML",
+                  "-F", "caption=<admin_caption.txt",
+                  "-F", "document=@" + apk,
+              ], stdout=subprocess.DEVNULL)
+          PY
